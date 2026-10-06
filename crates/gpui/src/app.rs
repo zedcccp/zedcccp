@@ -46,15 +46,16 @@ use crate::asset_cache::CachedLoad;
 use crate::{
     Action, ActionBuildError, ActionRegistry, ActivationPolicy, ActivityGuard, Any, AnyView,
     AnyWindowHandle, AppContext, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds,
-    ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase, DisplayId, EventEmitter,
-    ExternalDragPayload, FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext,
-    Keymap, Keystroke, LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions,
-    Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point,
-    Priority, PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
-    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
-    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
-    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
-    WindowHandle, WindowId, WindowInvalidator, WindowingRequest,
+    ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase, DisplayEvent, DisplayId,
+    EventEmitter, ExternalDragPayload, FocusHandle, FocusMap, ForegroundExecutor, Global,
+    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu,
+    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
+    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
+    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
+    SharedString, SubscriberSet, Subscription, SvgRenderer, SystemNotification,
+    SystemNotificationResponse, Task, TextRenderingMode, TextSystem, ThermalState, Window,
+    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
+    WindowingRequest,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -329,6 +330,7 @@ impl Application {
 }
 
 type Handler = Box<dyn FnMut(&mut App) -> bool + 'static>;
+type DisplayHandler = Box<dyn FnMut(DisplayEvent, &mut App) -> bool + 'static>;
 type Listener = Box<dyn FnMut(&dyn Any, &mut App) -> bool + 'static>;
 type MissingGlyphCallback = Box<dyn FnMut(&[MissingGlyph], &mut App) + 'static>;
 pub(crate) type KeystrokeObserver =
@@ -788,6 +790,7 @@ pub struct App {
     pub(crate) keyboard_layout_observers: SubscriberSet<(), Handler>,
     missing_glyph_callback: Rc<MissingGlyphCallbackSlot>,
     pub(crate) thermal_state_observers: SubscriberSet<(), Handler>,
+    pub(crate) display_observers: SubscriberSet<(), DisplayHandler>,
     pub(crate) system_sleep_observers: SubscriberSet<(), Handler>,
     pub(crate) system_wake_observers: SubscriberSet<(), Handler>,
     pub(crate) release_listeners: SubscriberSet<EntityId, ReleaseListener>,
@@ -924,6 +927,7 @@ impl App {
                 keyboard_layout_observers: SubscriberSet::new(),
                 missing_glyph_callback: Rc::default(),
                 thermal_state_observers: SubscriberSet::new(),
+                display_observers: SubscriberSet::new(),
                 system_sleep_observers: SubscriberSet::new(),
                 system_wake_observers: SubscriberSet::new(),
                 global_observers: SubscriberSet::new(),
@@ -983,6 +987,19 @@ impl App {
                     cx.thermal_state_observers
                         .clone()
                         .retain(&(), move |callback| (callback)(cx));
+                }
+            }
+        }));
+
+        platform.on_display_change(Box::new({
+            let app = Rc::downgrade(&app);
+            move |event| {
+                if let Some(app) = app.upgrade() {
+                    let mut app = app.borrow_mut();
+                    let cx: &mut App = &mut app;
+                    cx.display_observers
+                        .clone()
+                        .retain(&(), |callback| (callback)(event, cx));
                 }
             }
         }));
@@ -1547,6 +1564,22 @@ impl App {
             (),
             Box::new(move |cx| {
                 callback(cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Invokes a handler when any display is connected or disconnected.
+    pub fn observe_displays<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(DisplayEvent, &mut App),
+    {
+        let (subscription, activate) = self.display_observers.insert(
+            (),
+            Box::new(move |event, cx| {
+                callback(event, cx);
                 true
             }),
         );

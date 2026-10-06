@@ -2,14 +2,18 @@ use crate::ns_string;
 use anyhow::Result;
 use cocoa::{
     appkit::NSScreen,
-    base::{id, nil},
+    base::{BOOL, NO, YES, id, nil},
     foundation::{NSArray, NSDictionary},
 };
+use collections::HashSet;
 use core_foundation::base::CFRelease;
 use core_foundation::uuid::{CFUUIDGetUUIDBytes, CFUUIDRef};
-use core_graphics::display::{CGDirectDisplayID, CGDisplayBounds, CGGetActiveDisplayList};
-use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, point, px, size};
+use core_graphics::display::{
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetActiveDisplayList,
+};
+use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, point, px, refresh_interval_from_hz, size};
 use objc::{msg_send, sel, sel_impl};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -149,6 +153,36 @@ impl PlatformDisplay for MacDisplay {
 }
 
 impl MacDisplay {
+    /// The IDs of the active displays.
+    pub(crate) fn ids() -> HashSet<DisplayId> {
+        Self::all().map(|display| display.id()).collect()
+    }
+
+    /// Reads the display's refresh interval from the system.
+    pub(crate) fn refresh_interval(&self) -> Option<Duration> {
+        // `maximumFramesPerSecond` is the ProMotion maximum, where the
+        // display mode's rate is 0 on built-in panels.
+        let screen_hertz = unsafe {
+            let screen = self.get_nsscreen();
+            let supports_maximum: BOOL = if screen == nil {
+                NO
+            } else {
+                msg_send![screen, respondsToSelector: sel!(maximumFramesPerSecond)]
+            };
+            if supports_maximum == YES {
+                let frames_per_second: isize = msg_send![screen, maximumFramesPerSecond];
+                frames_per_second as f64
+            } else {
+                0.0
+            }
+        };
+        refresh_interval_from_hz(screen_hertz).or_else(|| {
+            CGDisplay::new(self.0)
+                .display_mode()
+                .and_then(|mode| refresh_interval_from_hz(mode.refresh_rate()))
+        })
+    }
+
     /// Find the NSScreen corresponding to this display
     unsafe fn get_nsscreen(&self) -> id {
         let screens = unsafe { NSScreen::screens(nil) };

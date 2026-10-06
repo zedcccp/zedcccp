@@ -368,6 +368,9 @@ impl Platform for WebPlatform {
         Some(self.active_display.clone())
     }
 
+    // The browser is the only display, and it never changes.
+    fn on_display_change(&self, _callback: Box<dyn FnMut(gpui::DisplayEvent)>) {}
+
     fn active_window(&self) -> Option<AnyWindowHandle> {
         *self.active_window.borrow()
     }

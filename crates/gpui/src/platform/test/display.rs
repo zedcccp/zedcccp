@@ -10,8 +10,12 @@ pub(crate) struct TestDisplay {
 
 impl TestDisplay {
     pub fn new() -> Self {
+        Self::with_id(DisplayId(1))
+    }
+
+    pub fn with_id(id: DisplayId) -> Self {
         TestDisplay {
-            id: DisplayId(1),
+            id,
             uuid: uuid::Uuid::new_v4(),
             bounds: Bounds::from_corners(Point::default(), Point::new(px(1920.), px(1080.))),
         }

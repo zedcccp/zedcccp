@@ -4,11 +4,11 @@ use crate::NoopTextSystem;
 use crate::PathPromptOptions;
 use crate::{
     ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, OwnedMenu, Platform, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SharedString,
-    SourceMetadata, SystemNotification, SystemNotificationResponse, Task, TestDisplay, TestWindow,
-    ThermalState, WindowAppearance, WindowParams, size,
+    DisplayEvent, DisplayId, DummyKeyboardMapper, ForegroundExecutor, Keymap, OwnedMenu, Platform,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
+    SharedString, SourceMetadata, SystemNotification, SystemNotificationResponse, Task,
+    TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
 };
 use anyhow::Result;
 #[cfg(any(test, feature = "test-support"))]
@@ -33,6 +33,7 @@ pub(crate) struct TestPlatform {
 
     pub(crate) active_window: RefCell<Option<TestWindow>>,
     active_display: Rc<dyn PlatformDisplay>,
+    display_change_callback: RefCell<Option<Box<dyn FnMut(DisplayEvent)>>>,
     active_cursor: Mutex<CursorStyle>,
     current_clipboard_item: Mutex<Option<ClipboardItem>>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -140,6 +141,24 @@ impl TestPlatform {
         Self::with_platform(executor, foreground_executor, text_system, None)
     }
 
+    pub(crate) fn simulate_display_added(&self, display_id: DisplayId) {
+        self.report_display_event(DisplayEvent::Added(display_id));
+    }
+
+    pub(crate) fn simulate_display_removed(&self, display_id: DisplayId) {
+        self.report_display_event(DisplayEvent::Removed(display_id));
+    }
+
+    fn report_display_event(&self, event: DisplayEvent) {
+        let callback = self.display_change_callback.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback(event);
+            self.display_change_callback
+                .borrow_mut()
+                .get_or_insert(callback);
+        }
+    }
+
     pub fn with_platform(
         executor: BackgroundExecutor,
         foreground_executor: ForegroundExecutor,
@@ -156,6 +175,7 @@ impl TestPlatform {
             screen_capture_sources: Default::default(),
             active_cursor: Default::default(),
             active_display: Rc::new(TestDisplay::new()),
+            display_change_callback: Default::default(),
             active_window: Default::default(),
             expect_restart: Default::default(),
             current_clipboard_item: Mutex::new(None),
@@ -463,6 +483,10 @@ impl Platform for TestPlatform {
 
     fn primary_display(&self) -> Option<std::rc::Rc<dyn crate::PlatformDisplay>> {
         Some(self.active_display.clone())
+    }
+
+    fn on_display_change(&self, callback: Box<dyn FnMut(DisplayEvent)>) {
+        *self.display_change_callback.borrow_mut() = Some(callback);
     }
 
     fn is_screen_capture_supported(&self) -> bool {

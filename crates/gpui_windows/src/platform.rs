@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use collections::HashSet;
 use futures::channel::oneshot::Receiver;
 use gpui_util::{ResultExt, get_powershell, new_std_command};
 use itertools::Itertools;
@@ -98,6 +99,8 @@ pub(crate) struct WindowsPlatformState {
     /// thread; see [`DrawCoordinator`].
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     directx_devices: RefCell<Option<DirectXDevices>>,
+    /// Updated when a window reports `WM_DISPLAYCHANGE`.
+    display_ids: RefCell<HashSet<DisplayId>>,
 }
 
 #[derive(Default)]
@@ -111,6 +114,7 @@ struct PlatformCallbacks {
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_sleep: Cell<Option<Box<dyn FnMut()>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+    display_change: Cell<Option<Box<dyn FnMut(DisplayEvent)>>>,
 }
 
 impl WindowsPlatformState {
@@ -127,6 +131,7 @@ impl WindowsPlatformState {
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
             menus: RefCell::new(Vec::new()),
+            display_ids: RefCell::new(WindowsDisplay::ids()),
         }
     }
 }
@@ -731,6 +736,14 @@ impl Platform for WindowsPlatform {
         WindowsDisplay::primary_monitor().map(|display| Rc::new(display) as Rc<dyn PlatformDisplay>)
     }
 
+    fn on_display_change(&self, callback: Box<dyn FnMut(DisplayEvent)>) {
+        self.inner
+            .state
+            .callbacks
+            .display_change
+            .set(Some(callback));
+    }
+
     #[cfg(feature = "screen-capture")]
     fn is_screen_capture_supported(&self) -> bool {
         true
@@ -1179,6 +1192,7 @@ impl WindowsPlatformInner {
             | WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD
             | WM_GPUI_DOCK_MENU_ACTION
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
+            | WM_GPUI_DISPLAYS_CHANGED
             | WM_GPUI_GPU_DEVICE_LOST
             | WM_GPUI_END_SESSION => self.handle_gpui_events(msg, wparam, lparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
@@ -1204,10 +1218,26 @@ impl WindowsPlatformInner {
             WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD => self.run_foreground_task(),
             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
+            WM_GPUI_DISPLAYS_CHANGED => self.handle_displays_changed(),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             WM_GPUI_END_SESSION => self.handle_end_session(),
             _ => unreachable!(),
         }
+    }
+
+    fn handle_displays_changed(&self) -> Option<isize> {
+        let current = WindowsDisplay::ids();
+        let events = gpui::display_events(&self.state.display_ids.borrow(), &current);
+        *self.state.display_ids.borrow_mut() = current;
+        self.with_callback(
+            |callbacks| &callbacks.display_change,
+            |callback| {
+                for event in events {
+                    callback(event);
+                }
+            },
+        );
+        Some(0)
     }
 
     fn handle_end_session(&self) -> Option<isize> {

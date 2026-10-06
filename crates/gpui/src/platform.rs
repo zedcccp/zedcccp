@@ -48,7 +48,7 @@ use crate::{
 use anyhow::bail;
 use anyhow::{Context as _, Result};
 use async_task::Runnable;
-use collections::FxHashMap;
+use collections::{FxHashMap, HashSet};
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use image::RgbaImage;
@@ -117,6 +117,39 @@ impl WindowVisibility {
     pub fn is_visible(self) -> bool {
         self == Self::Visible
     }
+}
+
+/// A change to the connected displays, reported through
+/// [`App::observe_displays`](crate::App::observe_displays).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DisplayEvent {
+    /// A display was connected.
+    Added(DisplayId),
+    /// A display was disconnected. Windows on it are moved to another
+    /// display by the platform.
+    Removed(DisplayId),
+}
+
+/// The events that turn one snapshot of the connected displays into the next,
+/// for platforms whose display notifications don't say what changed.
+pub fn display_events(
+    previous: &HashSet<DisplayId>,
+    current: &HashSet<DisplayId>,
+) -> Vec<DisplayEvent> {
+    let removed = previous
+        .difference(current)
+        .map(|id| DisplayEvent::Removed(*id));
+    let added = current
+        .difference(previous)
+        .map(|id| DisplayEvent::Added(*id));
+    removed.chain(added).collect()
+}
+
+/// Converts a refresh rate in hertz to the time between refreshes, rejecting
+/// the zero, negative, and non-finite rates platforms use to mean "unknown".
+pub fn refresh_interval_from_hz(hertz: f64) -> Option<Duration> {
+    (hertz.is_finite() && hertz > 0.0).then(|| Duration::from_secs_f64(1.0 / hertz))
 }
 
 /// Controls whether the application participates in the system's foreground UI.
@@ -351,6 +384,9 @@ pub trait Platform: 'static {
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>>;
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>>;
+    /// Registers the callback invoked when a display is added or removed. The
+    /// callback runs on the main thread.
+    fn on_display_change(&self, callback: Box<dyn FnMut(DisplayEvent)>);
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
         None
@@ -1215,6 +1251,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>);
     fn on_moved(&self, callback: Box<dyn FnMut()>);
+    /// The time between refreshes of the display the window is on. Variable
+    /// refresh rate displays report their maximum rate. `None` when the
+    /// platform doesn't report it.
+    ///
+    /// Returns the value the platform cached when the window's display last
+    /// changed, without querying the operating system.
+    fn refresh_interval(&self) -> Option<Duration>;
+    /// Registers the callback invoked when the window moves to another display
+    /// or its display's refresh interval changes. Calls may be spurious. The
+    /// callback runs on the main thread outside of any window update.
+    fn on_display_changed(&self, callback: Box<dyn FnMut()>);
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>);
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
@@ -3587,6 +3634,38 @@ mod frame_signal_tests {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_display_events() {
+        let previous = collections::HashSet::from_iter([DisplayId(1), DisplayId(2)]);
+        let current = collections::HashSet::from_iter([DisplayId(1), DisplayId(3)]);
+        let events = display_events(&previous, &current)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            events,
+            HashSet::from_iter([
+                DisplayEvent::Removed(DisplayId(2)),
+                DisplayEvent::Added(DisplayId(3)),
+            ])
+        );
+        assert_eq!(display_events(&current, &current), []);
+    }
+
+    #[test]
+    fn test_refresh_interval_from_hz() {
+        assert_eq!(
+            refresh_interval_from_hz(50.0),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(
+            refresh_interval_from_hz(120.0),
+            Some(Duration::from_secs(1) / 120)
+        );
+        for unknown in [0.0, -60.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(refresh_interval_from_hz(unknown), None);
+        }
+    }
 
     #[test]
     fn test_window_button_layout_parse_standard() {
