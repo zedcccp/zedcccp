@@ -2457,6 +2457,22 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    // Whether the pane layout persisted for `workspace_id` still contains the item
+    // with `item_id`. Session restore deserializes exactly these items, so an id
+    // left behind by a closed tab is not part of the restore.
+    query! {
+        pub fn contains_serialized_item(workspace_id: WorkspaceId, item_id: ItemId) -> Result<bool> {
+            // `SELECT item_id`, not `SELECT 1`: the `sql!` macro normalizes idents
+            // with a trailing space but literals without one, so a numeric literal
+            // immediately followed by a keyword is concatenated (`1FROM`) and fails
+            // the macro's compile-time SQLite check on non-Linux targets.
+            SELECT EXISTS(
+                SELECT item_id FROM items
+                WHERE workspace_id = ? AND item_id = ?
+            )
+        }
+    }
+
     query! {
         pub async fn update_timestamp(workspace_id: WorkspaceId) -> Result<()> {
             UPDATE workspaces

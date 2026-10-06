@@ -2145,10 +2145,40 @@ impl SerializableItem for MarkdownPreviewView {
     ) -> Task<Result<Entity<Self>>> {
         let db = persistence::MarkdownPreviewDb::global(cx);
         window.spawn(cx, async move |cx| {
-            let (abs_path, mode_value) = db
+            let (abs_path, mode_value, source_item_id) = db
                 .get_preview(item_id, workspace_id)?
                 .context("No markdown preview entry found")?;
             let mode = MarkdownPreviewMode::from_db(mode_value);
+
+            // A preview renders its source editor's buffer, not the file on disk,
+            // so it is restorable whenever the source file still exists, or when
+            // the source editor it was persisted with will itself be restored from
+            // recoverable unsaved contents. The source item id is only stored while
+            // that editor is an open workspace item, so a preview whose editor was
+            // closed cannot resurrect a stale tab; rows persisted without that id
+            // — before the column existed, or because no editor was open — fall
+            // back to the source editor found in the saved layout, which likewise
+            // excludes a closed editor. Without either condition, opening the
+            // preview would fabricate an empty buffer and announce it to language
+            // servers as an existing document.
+            let file_exists = project
+                .update(cx, |project, cx| project.abs_path_is_file(&abs_path, cx))
+                .await;
+            let source_is_recoverable = cx
+                .update(|_, cx| {
+                    editor::items::restores_unsaved_contents(
+                        source_item_id,
+                        workspace_id,
+                        &abs_path,
+                        cx,
+                    )
+                })
+                .unwrap_or(false);
+            if !file_exists && !source_is_recoverable {
+                anyhow::bail!(
+                    "Refusing to restore markdown preview for {abs_path:?}: not a readable file",
+                );
+            }
 
             let (worktree, relative_path) = project
                 .update(cx, |project, cx| {
@@ -2204,10 +2234,19 @@ impl SerializableItem for MarkdownPreviewView {
             .worktree_for_id(worktree_id, cx)?
             .read(cx)
             .absolutize(file.path());
+        // The source editor is the item this preview renders. Persist its id only
+        // while it is an open workspace item: restoration then consults exactly the
+        // editor state that session restore will apply, so a preview of a
+        // recoverable editor stays restorable when its file is gone, while a closed
+        // editor cannot make a stale preview restorable.
+        let source_item_id = self
+            .find_canonical_editor(workspace, cx)
+            .map(|editor| editor.entity_id().as_u64());
         let mode = self.mode.to_db();
         let db = persistence::MarkdownPreviewDb::global(cx);
         Some(cx.background_spawn(async move {
-            db.save_preview(item_id, workspace_id, abs_path, mode).await
+            db.save_preview(item_id, workspace_id, abs_path, mode, source_item_id)
+                .await
         }))
     }
 
@@ -2235,18 +2274,26 @@ mod persistence {
     impl Domain for MarkdownPreviewDb {
         const NAME: &str = stringify!(MarkdownPreviewDb);
 
-        const MIGRATIONS: &[&str] = &[sql!(
-            CREATE TABLE markdown_previews (
-                workspace_id INTEGER,
-                item_id INTEGER,
-                abs_path BLOB,
-                mode INTEGER NOT NULL DEFAULT 0,
+        const MIGRATIONS: &[&str] = &[
+            sql!(
+                CREATE TABLE markdown_previews (
+                    workspace_id INTEGER,
+                    item_id INTEGER,
+                    abs_path BLOB,
+                    mode INTEGER NOT NULL DEFAULT 0,
 
-                PRIMARY KEY(workspace_id, item_id),
-                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-                ON DELETE CASCADE
-            ) STRICT;
-        )];
+                    PRIMARY KEY(workspace_id, item_id),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                ) STRICT;
+            ),
+            // The item id of the source editor this preview renders, persisted only
+            // while that editor is an open workspace item. Restoration uses it to
+            // tell a preview of a recoverable editor from one whose editor is gone.
+            sql!(
+                ALTER TABLE markdown_previews ADD COLUMN source_item_id INTEGER;
+            ),
+        ];
     }
 
     db::static_connection!(MarkdownPreviewDb, [WorkspaceDb]);
@@ -2257,16 +2304,17 @@ mod persistence {
                 item_id: ItemId,
                 workspace_id: WorkspaceId,
                 abs_path: PathBuf,
-                mode: i64
+                mode: i64,
+                source_item_id: Option<ItemId>
             ) -> Result<()> {
-                INSERT OR REPLACE INTO markdown_previews(item_id, workspace_id, abs_path, mode)
-                VALUES (?, ?, ?, ?)
+                INSERT OR REPLACE INTO markdown_previews(item_id, workspace_id, abs_path, mode, source_item_id)
+                VALUES (?, ?, ?, ?, ?)
             }
         }
 
         query! {
-            pub fn get_preview(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(PathBuf, i64)>> {
-                SELECT abs_path, mode
+            pub fn get_preview(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(PathBuf, i64, Option<ItemId>)>> {
+                SELECT abs_path, mode, source_item_id
                 FROM markdown_previews
                 WHERE item_id = ? AND workspace_id = ?
             }
@@ -2285,12 +2333,15 @@ mod tests {
     use editor::Editor;
     use editor::items::open_resolved_target;
     use fs::FakeFs;
+    use fs::Fs;
+    use futures::{FutureExt as _, StreamExt as _};
     use gpui::UpdateGlobal as _;
     use gpui::{
         App, AppContext as _, Entity, Focusable as _, Modifiers, MouseButton, MouseDownEvent,
         MouseUpEvent, TestAppContext, VisualTestContext, WindowHandle, px,
     };
-    use language::{Buffer, DiskState, Point};
+    use language::{Buffer, DiskState, FakeLspAdapter, Point};
+    use lsp::notification::DidOpenTextDocument;
     use project::{Project, ProjectPath};
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -2303,7 +2354,8 @@ mod tests {
     use workspace::item::{Item, ItemHandle, SerializableItem};
     use workspace::path_link::{OpenTarget, OpenTargetFoundBy};
     use workspace::{
-        AppState, ItemId, MultiWorkspace, Pane, SaveIntent, Workspace, WorkspaceId, open_paths,
+        AppState, ItemId, MultiWorkspace, Pane, SaveIntent, Workspace, WorkspaceDb, WorkspaceId,
+        open_paths,
     };
 
     use super::{
@@ -4429,6 +4481,960 @@ mod tests {
             MarkdownPreviewView::get_folder_for_active_editor(editor, cx)
         });
         assert_eq!(folder, Some(PathBuf::from("/remote/project/docs")));
+    }
+
+    // A persisted markdown preview is a view of a file on disk, so it must not be
+    // restored once that file is gone: the preview would otherwise open an empty
+    // buffer and announce it to language servers as an existing document.
+    // https://github.com/zed-industries/zed/issues/64231
+    #[gpui::test]
+    async fn deserialize_does_not_restore_preview_for_missing_file(cx: &mut TestAppContext) {
+        let (project, _workspace, multi_workspace) = markdown_workspace(
+            cx,
+            json!({
+                "docs": {
+                    "guide.md": "# Guide\n",
+                    "readme.md": "# readme\n",
+                }
+            }),
+            false,
+        )
+        .await;
+
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        let mut fake_servers = language_registry.register_fake_lsp(
+            "Markdown",
+            FakeLspAdapter {
+                name: "the-markdown-language-server",
+                ..Default::default()
+            },
+        );
+
+        let workspace_id = cx
+            .update(|cx| WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let preview_db = cx.update(|cx| super::persistence::MarkdownPreviewDb::global(cx));
+
+        let restore_preview = |item_id: ItemId, cx: &mut TestAppContext| {
+            multi_workspace
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        MarkdownPreviewView::deserialize(
+                            project.clone(),
+                            workspace.weak_handle(),
+                            workspace_id,
+                            item_id,
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .unwrap()
+        };
+
+        // Positive control: a preview whose file still exists restores.
+        let valid_id = 31_001 as ItemId;
+        preview_db
+            .save_preview(
+                valid_id,
+                workspace_id,
+                PathBuf::from(path!("/project/docs/guide.md")),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let restored = restore_preview(valid_id, cx).await;
+        assert!(
+            restored.is_ok(),
+            "a preview for an existing file must restore"
+        );
+        cx.run_until_parked();
+
+        // Positive control: the preview's buffer was created and announced, proving
+        // the fake server observes `didOpen` traffic on this path.
+        let mut fake_server = fake_servers.next().await.unwrap();
+        let did_open = fake_server
+            .receive_notification::<DidOpenTextDocument>()
+            .await;
+        assert!(
+            did_open
+                .text_document
+                .uri
+                .as_str()
+                .ends_with("docs/guide.md"),
+            "the existing file should have been announced, got {:?}",
+            did_open.text_document.uri
+        );
+
+        // The file was deleted while the app was closed.
+        let missing_id = 31_002 as ItemId;
+        preview_db
+            .save_preview(
+                missing_id,
+                workspace_id,
+                PathBuf::from(path!("/project/docs/readme.md")),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        fs.remove_file(
+            Path::new(path!("/project/docs/readme.md")),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let restored = restore_preview(missing_id, cx).await;
+        assert!(
+            restored.is_err(),
+            "a preview for a deleted file must not be restored"
+        );
+        cx.run_until_parked();
+        assert!(
+            !project.read_with(cx, |project, cx| {
+                project.buffer_store().read(cx).buffers().any(|buffer| {
+                    buffer
+                        .read(cx)
+                        .file()
+                        .is_some_and(|file| file.path().as_std_path().ends_with("docs/readme.md"))
+                })
+            }),
+            "no buffer may be created for the deleted preview source"
+        );
+        assert!(
+            fake_server
+                .try_receive_notification::<DidOpenTextDocument>()
+                .now_or_never()
+                .is_none(),
+            "a missing preview source must never be announced to language servers"
+        );
+    }
+
+    // A markdown preview renders its source editor's buffer rather than the file on
+    // disk, so it must survive a restart exactly when the source editor does. A
+    // dirty editor is restored from its recovered contents even though its file is
+    // gone, and the preview of that buffer must come back with it, in either restore
+    // order, without fabricating an empty file-backed document.
+    // https://github.com/zed-industries/zed/issues/64231
+    #[gpui::test]
+    async fn recoverable_editor_and_preview_restore_after_source_deleted(cx: &mut TestAppContext) {
+        let (fs, workspace_id, preview_id, editor_id, unsaved) = persist_editor_with_preview(
+            cx,
+            json!({ "note.md": "# Note\n" }),
+            "note.md",
+            Some("dirty\n"),
+            false,
+        )
+        .await;
+
+        fs.remove_file(Path::new(path!("/project/note.md")), Default::default())
+            .await
+            .unwrap();
+
+        let (project, multi_workspace) = new_restore_session(cx, fs.clone()).await;
+
+        // Restore in the order a layout whose editor pane comes first produces.
+        let editor = deserialize_editor_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            editor_id,
+        )
+        .await
+        .expect("a recoverable editor must restore even though its file is gone");
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), unsaved);
+            assert!(editor.is_dirty(cx), "recovered contents stay unsaved");
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap().read(cx);
+            assert!(
+                matches!(
+                    buffer.file().map(|file| file.disk_state()),
+                    Some(DiskState::New)
+                ),
+                "the recovered document is not backed by an existing file"
+            );
+        });
+
+        let preview = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_id,
+        )
+        .await
+        .expect("a preview of a recoverable editor must restore even though its file is gone");
+
+        // The preview must render the restored editor's buffer, not a fresh document.
+        let preview_editor = preview_editor(&preview, cx);
+        assert_eq!(
+            preview_editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()),
+            editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()),
+            "the preview must share the recovered editor's buffer"
+        );
+        preview_editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), unsaved));
+
+        assert!(
+            !fs.is_file(Path::new(path!("/project/note.md"))).await,
+            "restoring the preview must not recreate the deleted file"
+        );
+    }
+
+    // The same state as above, but restored in the order a layout whose preview pane
+    // comes first produces. The preview must not be lost just because its source
+    // editor has not deserialized yet: the editor is scheduled to restore and fills
+    // the buffer the preview already opened.
+    #[gpui::test]
+    async fn recoverable_preview_restores_before_its_editor(cx: &mut TestAppContext) {
+        let (fs, workspace_id, preview_id, editor_id, unsaved) = persist_editor_with_preview(
+            cx,
+            json!({ "note.md": "# Note\n" }),
+            "note.md",
+            Some("dirty\n"),
+            false,
+        )
+        .await;
+
+        fs.remove_file(Path::new(path!("/project/note.md")), Default::default())
+            .await
+            .unwrap();
+
+        let (project, multi_workspace) = new_restore_session(cx, fs.clone()).await;
+
+        let preview = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_id,
+        )
+        .await
+        .expect("a preview of a recoverable editor must restore before that editor");
+        let editor = deserialize_editor_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            editor_id,
+        )
+        .await
+        .expect("the recoverable editor must restore after its preview");
+
+        let preview_editor = preview_editor(&preview, cx);
+        assert_eq!(
+            preview_editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()),
+            editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()),
+            "the preview must have opened the buffer the editor then restored into"
+        );
+        editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), unsaved));
+        preview_editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), unsaved));
+
+        assert!(
+            !fs.is_file(Path::new(path!("/project/note.md"))).await,
+            "restoring the preview must not recreate the deleted file"
+        );
+    }
+
+    // The normal path is unchanged: with the file still present, a dirty editor and
+    // its preview both restore, and the preview shows the recovered contents.
+    #[gpui::test]
+    async fn preview_with_recoverable_editor_restores_when_source_exists(cx: &mut TestAppContext) {
+        let (fs, workspace_id, preview_id, editor_id, unsaved) = persist_editor_with_preview(
+            cx,
+            json!({ "note.md": "# Note\n" }),
+            "note.md",
+            Some("dirty\n"),
+            false,
+        )
+        .await;
+
+        let (project, multi_workspace) = new_restore_session(cx, fs).await;
+
+        let editor = deserialize_editor_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            editor_id,
+        )
+        .await
+        .expect("a dirty editor must restore when its file exists");
+        let preview = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_id,
+        )
+        .await
+        .expect("a preview must restore when its file exists");
+
+        editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), unsaved));
+        preview_editor(&preview, cx)
+            .read_with(cx, |editor, cx| assert_eq!(editor.text(cx), unsaved));
+    }
+
+    // A clean editor will not be restored for a deleted file, so a preview of that
+    // editor must not restore either: there would be no recovered contents to render,
+    // and opening the preview would fabricate an empty file-backed document.
+    #[gpui::test]
+    async fn preview_of_clean_editor_does_not_restore_when_source_deleted(cx: &mut TestAppContext) {
+        let (fs, workspace_id, preview_id, _editor_id, _unsaved) = persist_editor_with_preview(
+            cx,
+            json!({ "note.md": "# Note\n" }),
+            "note.md",
+            None,
+            false,
+        )
+        .await;
+
+        fs.remove_file(Path::new(path!("/project/note.md")), Default::default())
+            .await
+            .unwrap();
+
+        let (project, multi_workspace) = new_restore_session(cx, fs).await;
+
+        let restored = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_id,
+        )
+        .await;
+        assert!(
+            restored.is_err(),
+            "a preview whose editor has no recovered contents must not restore"
+        );
+        cx.run_until_parked();
+        assert!(
+            !has_buffer_for_path(&project, "note.md", cx),
+            "no buffer may be fabricated for the deleted preview source"
+        );
+    }
+
+    // The preview tracks the *specific* source editor it was persisted with. Closing
+    // that editor's tab while the preview stays open leaves a stale source id in the
+    // preview's row: the editor's unsaved-contents row survives, but the editor is no
+    // longer in the restored pane layout. Restoring the preview would fabricate an
+    // empty document that no editor ever fills.
+    #[gpui::test]
+    async fn preview_does_not_restore_when_source_editor_was_closed(cx: &mut TestAppContext) {
+        let (fs, workspace_id, preview_id, editor_id, _unsaved) = persist_editor_with_preview(
+            cx,
+            json!({ "note.md": "# Note\n" }),
+            "note.md",
+            Some("dirty\n"),
+            true,
+        )
+        .await;
+
+        // The editor's unsaved-contents row survives, but the editor is no longer
+        // part of the layout that will be restored.
+        assert!(
+            !cx.update(|cx| {
+                editor::items::restores_unsaved_contents(
+                    Some(editor_id),
+                    workspace_id,
+                    Path::new(path!("/project/note.md")),
+                    cx,
+                )
+            }),
+            "a closed editor is not part of the restore"
+        );
+
+        fs.remove_file(Path::new(path!("/project/note.md")), Default::default())
+            .await
+            .unwrap();
+
+        let (project, multi_workspace) = new_restore_session(cx, fs).await;
+
+        let restored = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_id,
+        )
+        .await;
+        assert!(
+            restored.is_err(),
+            "a preview whose source editor is no longer restored must not restore"
+        );
+        cx.run_until_parked();
+        assert!(
+            !has_buffer_for_path(&project, "note.md", cx),
+            "no buffer may be fabricated from a closed editor's stale row"
+        );
+    }
+
+    // A preview persisted before the source editor id was recorded — the state
+    // every database written by an older Zed is in — must still be matched to the
+    // dirty editor its saved layout restores, so it survives the first launch after
+    // the upgrade instead of being dropped.
+    #[gpui::test]
+    async fn preview_without_recorded_source_restores_its_recoverable_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, workspace_id, preview_id, editor_id, unsaved) = persist_editor_with_preview(
+            cx,
+            json!({ "note.md": "# Note\n" }),
+            "note.md",
+            Some("dirty\n"),
+            false,
+        )
+        .await;
+
+        assert!(
+            cx.update(|cx| {
+                editor::items::restores_unsaved_contents(
+                    Some(editor_id),
+                    workspace_id,
+                    Path::new(path!("/project/note.md")),
+                    cx,
+                )
+            }),
+            "sanity check: an editor row for the path is recoverable"
+        );
+
+        // Recreate the row an older database persisted: no recorded source id.
+        cx.update(|cx| super::persistence::MarkdownPreviewDb::global(cx))
+            .save_preview(
+                preview_id,
+                workspace_id,
+                PathBuf::from(path!("/project/note.md")),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            cx.update(|cx| {
+                editor::items::restores_unsaved_contents(
+                    None,
+                    workspace_id,
+                    Path::new(path!("/project/note.md")),
+                    cx,
+                )
+            }),
+            "a preview with no recorded source id must resolve its source from the saved layout"
+        );
+
+        fs.remove_file(Path::new(path!("/project/note.md")), Default::default())
+            .await
+            .unwrap();
+
+        let (project, multi_workspace) = new_restore_session(cx, fs.clone()).await;
+
+        let preview = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_id,
+        )
+        .await
+        .expect("a migrated preview of a recoverable editor must restore");
+        let source = deserialize_editor_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            editor_id,
+        )
+        .await
+        .expect("the recoverable editor must restore");
+
+        assert_eq!(
+            preview_editor(&preview, cx).read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()),
+            source.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()),
+            "the migrated preview must render the restored editor's buffer"
+        );
+        preview_editor(&preview, cx)
+            .read_with(cx, |editor, cx| assert_eq!(editor.text(cx), unsaved));
+        assert!(
+            !fs.is_file(Path::new(path!("/project/note.md"))).await,
+            "restoring the migrated preview must not recreate the deleted file"
+        );
+    }
+
+    // The saved-layout fallback must not invent a source: a preview without a
+    // recorded id whose editor is no longer part of the layout must not restore,
+    // even though an editor row for the path still carries recoverable contents.
+    #[gpui::test]
+    async fn preview_without_recorded_source_does_not_restore_when_source_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, workspace_id, preview_id, _editor_id, _unsaved) = persist_editor_with_preview(
+            cx,
+            json!({ "note.md": "# Note\n" }),
+            "note.md",
+            Some("dirty\n"),
+            true,
+        )
+        .await;
+
+        cx.update(|cx| super::persistence::MarkdownPreviewDb::global(cx))
+            .save_preview(
+                preview_id,
+                workspace_id,
+                PathBuf::from(path!("/project/note.md")),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !cx.update(|cx| {
+                editor::items::restores_unsaved_contents(
+                    None,
+                    workspace_id,
+                    Path::new(path!("/project/note.md")),
+                    cx,
+                )
+            }),
+            "no editor at the path is part of the restore, so there is nothing to match"
+        );
+
+        fs.remove_file(Path::new(path!("/project/note.md")), Default::default())
+            .await
+            .unwrap();
+
+        let (project, multi_workspace) = new_restore_session(cx, fs).await;
+
+        let restored = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_id,
+        )
+        .await;
+        assert!(
+            restored.is_err(),
+            "a preview with no recoverable source in the layout must not restore"
+        );
+        cx.run_until_parked();
+        assert!(
+            !has_buffer_for_path(&project, "note.md", cx),
+            "no buffer may be fabricated"
+        );
+    }
+
+    // Two dirty editors and two previews in one workspace: deleting both source
+    // files must restore each preview against its own editor's recovered buffer.
+    // If restoration matched a preview to another editor it would surface here as a
+    // shared or wrong buffer.
+    #[gpui::test]
+    async fn previews_do_not_cross_associate_their_source_editors(cx: &mut TestAppContext) {
+        let (project, workspace, multi_workspace) =
+            markdown_workspace(cx, json!({ "a.md": "# A\n", "b.md": "# B\n" }), false).await;
+        let fs = project.read_with(cx, |project, _| project.fs().as_fake());
+
+        let editor_a = open_project_file(cx, &project, &multi_workspace, "a.md", None, true)
+            .await
+            .downcast::<Editor>()
+            .unwrap();
+        let editor_b = open_project_file(cx, &project, &multi_workspace, "b.md", None, true)
+            .await
+            .downcast::<Editor>()
+            .unwrap();
+        for (editor, appended) in [(&editor_a, "dirty a\n"), (&editor_b, "dirty b\n")] {
+            editor.update(cx, |editor, cx| {
+                let end = editor.buffer().read(cx).snapshot(cx).len();
+                editor.edit([(end..end, appended)], cx);
+            });
+        }
+
+        let (preview_a, preview_b) = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    let pane = workspace.active_pane().clone();
+                    let preview_a = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor_a.clone(),
+                        window,
+                        cx,
+                    );
+                    let preview_b = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor_b.clone(),
+                        window,
+                        cx,
+                    );
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview_a.clone()), true, true, None, window, cx);
+                        pane.add_item(Box::new(preview_b.clone()), true, true, None, window, cx);
+                    });
+                    (preview_a, preview_b)
+                })
+            })
+            .unwrap();
+
+        let serialization_tasks = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.flush_all_serialization(window, cx)
+            })
+            .unwrap();
+        for task in serialization_tasks {
+            task.await;
+        }
+        let workspace_id = workspace.read_with(cx, |workspace, _| workspace.database_id().unwrap());
+
+        serialize_item(cx, &multi_workspace, &editor_a).await;
+        serialize_item(cx, &multi_workspace, &editor_b).await;
+        serialize_item(cx, &multi_workspace, &preview_a).await;
+        serialize_item(cx, &multi_workspace, &preview_b).await;
+
+        let editor_a_id = editor_a.entity_id().as_u64();
+        let editor_b_id = editor_b.entity_id().as_u64();
+        let preview_a_id = preview_a.entity_id().as_u64();
+        let preview_b_id = preview_b.entity_id().as_u64();
+
+        for file in ["a.md", "b.md"] {
+            fs.remove_file(
+                &PathBuf::from(path!("/project")).join(file),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (project, multi_workspace) = new_restore_session(cx, fs).await;
+
+        // Restore each preview before its editor, the order a layout with the
+        // preview pane first produces.
+        let preview_a = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_a_id,
+        )
+        .await
+        .expect("preview A must restore with its recoverable editor");
+        let preview_b = deserialize_preview_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            preview_b_id,
+        )
+        .await
+        .expect("preview B must restore with its recoverable editor");
+        let editor_a = deserialize_editor_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            editor_a_id,
+        )
+        .await
+        .expect("editor A must restore");
+        let editor_b = deserialize_editor_in_session(
+            cx,
+            project.clone(),
+            &multi_workspace,
+            workspace_id,
+            editor_b_id,
+        )
+        .await
+        .expect("editor B must restore");
+
+        let buffer_of = |editor: &Entity<Editor>, cx: &TestAppContext| {
+            editor.read_with(cx, |editor, cx| {
+                editor.buffer().read(cx).as_singleton().unwrap()
+            })
+        };
+        let buffer_a = buffer_of(&editor_a, cx);
+        let buffer_b = buffer_of(&editor_b, cx);
+        assert_ne!(
+            buffer_a, buffer_b,
+            "the two editors must not share a buffer"
+        );
+        assert_eq!(
+            buffer_of(&preview_editor(&preview_a, cx), cx),
+            buffer_a,
+            "preview A must render editor A's buffer"
+        );
+        assert_eq!(
+            buffer_of(&preview_editor(&preview_b, cx), cx),
+            buffer_b,
+            "preview B must render editor B's buffer"
+        );
+        preview_editor(&preview_a, cx).read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "# A\ndirty a\n")
+        });
+        preview_editor(&preview_b, cx).read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "# B\ndirty b\n")
+        });
+    }
+
+    fn preview_editor(
+        preview: &Entity<MarkdownPreviewView>,
+        cx: &TestAppContext,
+    ) -> Entity<Editor> {
+        preview.read_with(cx, |preview, _| {
+            preview
+                .active_editor
+                .as_ref()
+                .expect("the restored preview should have a source editor")
+                .editor
+                .clone()
+        })
+    }
+
+    fn has_buffer_for_path(project: &Entity<Project>, suffix: &str, cx: &TestAppContext) -> bool {
+        project.read_with(cx, |project, cx| {
+            project.buffer_store().read(cx).buffers().any(|buffer| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .is_some_and(|file| file.path().as_std_path().ends_with(suffix))
+            })
+        })
+    }
+
+    /// Persists `item`'s own state for the workspace active in `multi_workspace`, the
+    /// way the workspace's item serializer does. Used after a flush has created the
+    /// workspace row the item's state references.
+    async fn serialize_item<I: SerializableItem>(
+        cx: &mut TestAppContext,
+        multi_workspace: &WindowHandle<MultiWorkspace>,
+        item: &Entity<I>,
+    ) {
+        multi_workspace
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    item.update(cx, |item, cx| {
+                        item.serialize(workspace, cx.entity_id().as_u64(), false, cx)
+                    })
+                    .unwrap()
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    /// Simulates the first session: opens `source`, optionally makes it dirty, binds
+    /// a preview to the editor, and flushes serialization so both items are persisted.
+    /// Returns the shared filesystem and the ids and contents needed to restore them.
+    ///
+    /// With `close_source_editor`, the source editor's tab is then closed the way a
+    /// user would — the preview stays open and keeps the editor's buffer alive — and
+    /// the pane layout is serialized without it, reproducing a preview persisted
+    /// alongside an editor that is no longer part of the workspace.
+    async fn persist_editor_with_preview(
+        cx: &mut TestAppContext,
+        files: serde_json::Value,
+        source: &str,
+        appended: Option<&str>,
+        close_source_editor: bool,
+    ) -> (Arc<FakeFs>, WorkspaceId, ItemId, ItemId, String) {
+        let (project, workspace, multi_workspace) = markdown_workspace(cx, files, false).await;
+        let fs = project.read_with(cx, |project, _| project.fs().as_fake());
+
+        let editor = open_project_file(cx, &project, &multi_workspace, source, None, true)
+            .await
+            .downcast::<Editor>()
+            .unwrap();
+        if let Some(appended) = appended {
+            editor.update(cx, |editor, cx| {
+                let end = editor.buffer().read(cx).snapshot(cx).len();
+                editor.edit([(end..end, appended)], cx);
+            });
+        }
+        let unsaved = editor.read_with(cx, |editor, cx| editor.text(cx));
+
+        let preview = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    let preview = MarkdownPreviewView::create_markdown_view(
+                        workspace,
+                        editor.clone(),
+                        window,
+                        cx,
+                    );
+                    workspace.active_pane().update(cx, |pane, cx| {
+                        pane.add_item(Box::new(preview.clone()), true, true, None, window, cx)
+                    });
+                    preview
+                })
+            })
+            .unwrap();
+
+        let serialization_tasks = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.flush_all_serialization(window, cx)
+            })
+            .unwrap();
+        for task in serialization_tasks {
+            task.await;
+        }
+
+        let workspace_id = workspace.read_with(cx, |workspace, _| workspace.database_id().unwrap());
+
+        // Persist both items explicitly now that the workspace row exists. Flushing
+        // starts the item inserts before `serialize_workspace_internal` has written
+        // the workspace they reference, so those inserts race the foreign key and may
+        // not land.
+        serialize_item(cx, &multi_workspace, &editor).await;
+        serialize_item(cx, &multi_workspace, &preview).await;
+
+        let preview_id = preview.entity_id().as_u64();
+        let editor_id = editor.entity_id().as_u64();
+        let abs_path = PathBuf::from(path!("/project")).join(source);
+
+        if close_source_editor {
+            // Close the editor's tab, keeping the preview (which holds the buffer
+            // alive), and serialize the pane layout without the editor.
+            multi_workspace
+                .update(cx, |multi_workspace, window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.active_pane().update(cx, |pane, cx| {
+                            pane.remove_item(editor.entity_id(), false, false, window, cx);
+                        });
+                    })
+                })
+                .unwrap();
+            wait_for_preview_serialization(cx).await;
+
+            // A crash after the tab closed but before the preview was re-serialized
+            // leaves the preview row still naming the closed editor. Recreate that
+            // state exactly.
+            cx.update(|cx| super::persistence::MarkdownPreviewDb::global(cx))
+                .save_preview(
+                    preview_id,
+                    workspace_id,
+                    abs_path.clone(),
+                    0,
+                    Some(editor_id),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Both rows must exist, or the tests below would pass because restoration
+        // found nothing to restore rather than because of the guard under test.
+        let saved_preview = cx.update(|cx| {
+            super::persistence::MarkdownPreviewDb::global(cx)
+                .get_preview(preview_id, workspace_id)
+                .unwrap()
+        });
+        assert!(
+            saved_preview.is_some(),
+            "the preview row must be persisted before restoration"
+        );
+        assert_eq!(
+            cx.update(|cx| editor::items::restores_unsaved_contents(
+                Some(editor_id),
+                workspace_id,
+                &abs_path,
+                cx
+            )),
+            appended.is_some() && !close_source_editor,
+            "the editor must be recoverable exactly when it is dirty and still part of the restore"
+        );
+
+        (fs, workspace_id, preview_id, editor_id, unsaved)
+    }
+
+    /// A fresh project over the same filesystem, standing in for a new Zed process:
+    /// it holds no buffers, so restoration has to read what was persisted.
+    async fn new_restore_session(
+        cx: &mut TestAppContext,
+        fs: Arc<FakeFs>,
+    ) -> (Entity<Project>, WindowHandle<MultiWorkspace>) {
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        register_markdown_language(&project, cx);
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        (project, multi_workspace)
+    }
+
+    async fn deserialize_editor_in_session(
+        cx: &mut TestAppContext,
+        project: Entity<Project>,
+        multi_workspace: &WindowHandle<MultiWorkspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+    ) -> anyhow::Result<Entity<Editor>> {
+        multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    Editor::deserialize(
+                        project.clone(),
+                        workspace.weak_handle(),
+                        workspace_id,
+                        item_id,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .await
+    }
+
+    async fn deserialize_preview_in_session(
+        cx: &mut TestAppContext,
+        project: Entity<Project>,
+        multi_workspace: &WindowHandle<MultiWorkspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+    ) -> anyhow::Result<Entity<MarkdownPreviewView>> {
+        multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    MarkdownPreviewView::deserialize(
+                        project.clone(),
+                        workspace.weak_handle(),
+                        workspace_id,
+                        item_id,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+            .await
     }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
