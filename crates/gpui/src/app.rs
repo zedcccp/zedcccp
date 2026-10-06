@@ -2867,6 +2867,7 @@ impl App {
             PromptLevel,
             &str,
             Option<&str>,
+            Option<&str>,
             &[PromptButton],
             PromptHandle,
             &mut Window,
