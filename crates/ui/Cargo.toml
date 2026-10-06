@@ -41,3 +41,4 @@ ignored = ["log"]
 
 [features]
 default = []
+inspector = ["gpui/inspector", "gpui_macros/inspector"]
