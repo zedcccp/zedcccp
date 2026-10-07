@@ -110,7 +110,8 @@ pub struct EditorSettingsContent {
     /// Default: 4.0
     #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub fast_scroll_sensitivity: Option<f32>,
-    /// Settings for scrolling with a smooth animation.
+    /// Settings for animating line-based wheel and keyboard scrolling.
+    /// Pixel-precise scrolling follows the input directly.
     ///
     /// Default: smooth scroll is disabled
     pub smooth_scroll: Option<SmoothScrollContent>,

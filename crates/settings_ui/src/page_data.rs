@@ -2148,7 +2148,7 @@ fn editor_page() -> SettingsPage {
             }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Smooth Scroll",
-                description: "Animate scroll with a smooth effect",
+                description: "Animate line-based wheel and keyboard scrolling. Pixel-precise scrolling follows the input directly.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("smooth_scroll.enabled"),

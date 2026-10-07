@@ -3496,6 +3496,194 @@ async fn test_move_to_previous_comment_paragraph_skips_current_paragraph(cx: &mu
 }
 
 #[gpui::test]
+async fn test_scroll_wheel_pixels_are_instant(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    for enabled in [true, false] {
+        update_test_editor_settings(cx, &|settings| {
+            settings.smooth_scroll = Some(settings::SmoothScrollContent {
+                enabled: Some(enabled),
+            });
+            settings.scroll_sensitivity = Some(1.);
+        });
+        let mut cx = EditorTestContext::new(cx).await;
+        let line_height = cx.update_editor(|editor, window, cx| {
+            editor.set_vertical_scroll_margin(0, cx);
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        });
+        let window = cx.window;
+        cx.simulate_window_resize(window, size(px(1000.), 4. * line_height));
+        cx.set_state(&format!("ˇ{}", "line\n".repeat(40)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        for (touch_phase, expected_row) in [
+            (gpui::TouchPhase::Started, 1.),
+            (gpui::TouchPhase::Moved, 2.),
+            (gpui::TouchPhase::Moved, 3.),
+        ] {
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                        position: point(px(200.), line_height),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), -line_height)),
+                        touch_phase,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+            cx.update_editor(|editor, window, cx| {
+                assert_eq!(
+                    editor.snapshot(window, cx).scroll_position(),
+                    point(0., expected_row)
+                );
+                assert!(editor.scroll_manager.scroll_animation().is_none());
+            });
+        }
+    }
+}
+
+#[gpui::test]
+async fn test_scroll_wheel_lines_accumulate_animation_target(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    for enabled in [true, false] {
+        update_test_editor_settings(cx, &|settings| {
+            settings.smooth_scroll = Some(settings::SmoothScrollContent {
+                enabled: Some(enabled),
+            });
+            settings.scroll_sensitivity = Some(1.);
+        });
+        let mut cx = EditorTestContext::new(cx).await;
+        let line_height = cx.update_editor(|editor, window, cx| {
+            editor.set_vertical_scroll_margin(0, cx);
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        });
+        let window = cx.window;
+        cx.simulate_window_resize(window, size(px(1000.), 4. * line_height));
+        cx.set_state(&format!("ˇ{}", "line\n".repeat(40)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+
+        // Do not draw between events: advancing animation frames would obscure
+        // whether the second wheel tick accumulates against the pending target.
+        let editor = cx.editor.clone();
+        cx.update(|window, cx| {
+            for expected_row in [3., 6., 9.] {
+                window.dispatch_event(
+                    gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                        position: point(px(200.), line_height),
+                        delta: gpui::ScrollDelta::Lines(point(0., -3.)),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                editor.update(cx, |editor, cx| {
+                    if enabled {
+                        let animation = editor
+                            .scroll_manager
+                            .scroll_animation()
+                            .expect("line scrolling should animate");
+                        assert!(animation.is_animating());
+                        assert_eq!(animation.target_position(), point(0., expected_row));
+                        assert_eq!(editor.scroll_position(cx), point(0., 0.));
+                    } else {
+                        assert!(editor.scroll_manager.scroll_animation().is_none());
+                        assert_eq!(editor.scroll_position(cx), point(0., expected_row));
+                    }
+                });
+            }
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_scroll_wheel_pixels_cancel_pending_line_animation(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.smooth_scroll = Some(settings::SmoothScrollContent {
+            enabled: Some(true),
+        });
+        settings.scroll_sensitivity = Some(1.);
+    });
+    for pixel_delta_in_lines in [1., 0.] {
+        let mut cx = EditorTestContext::new(cx).await;
+        let line_height = cx.update_editor(|editor, window, cx| {
+            editor.set_vertical_scroll_margin(0, cx);
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        });
+        let window = cx.window;
+        cx.simulate_window_resize(window, size(px(1000.), 4. * line_height));
+        cx.set_state(&format!("ˇ{}", "line\n".repeat(40)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.update_editor(|editor, window, cx| {
+            editor.scroll_with_behavior(point(0., 2.), Some(ScrollBehavior::Instant), window, cx);
+        });
+        let editor = cx.editor.clone();
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position: point(px(200.), line_height),
+                    delta: gpui::ScrollDelta::Lines(point(0., -6.)),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            let visible_position = editor.update(cx, |editor, cx| {
+                let animation = editor
+                    .scroll_manager
+                    .scroll_animation()
+                    .expect("line scrolling should animate");
+                assert!(animation.is_animating());
+                assert_eq!(animation.target_position(), point(0., 8.));
+                let visible_position = editor.scroll_position(cx);
+                assert_eq!(visible_position, point(0., 2.));
+                visible_position
+            });
+
+            window.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position: point(px(200.), line_height),
+                    delta: gpui::ScrollDelta::Pixels(point(
+                        px(0.),
+                        -line_height * pixel_delta_in_lines,
+                    )),
+                    touch_phase: gpui::TouchPhase::Started,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            editor.update(cx, |editor, cx| {
+                let expected_position = point(
+                    visible_position.x,
+                    visible_position.y + f64::from(pixel_delta_in_lines),
+                );
+                assert_eq!(editor.scroll_position(cx), expected_position);
+                assert!(editor.scroll_manager.scroll_animation().is_none());
+                editor.flush_scroll_animation(window, cx);
+                assert_eq!(editor.scroll_position(cx), expected_position);
+                assert!(editor.scroll_manager.scroll_animation().is_none());
+            });
+        });
+    }
+}
+
+#[gpui::test]
 async fn test_instant_scroll_request_during_scroll_animation(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     update_test_editor_settings(cx, &|settings| {
