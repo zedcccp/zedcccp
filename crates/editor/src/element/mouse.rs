@@ -21,8 +21,11 @@ use crate::{
     CURSORS_VISIBLE_FOR, ColumnarMode, DisplayDiffHunk, DisplayPoint, DisplayRow, Editor,
     EditorSettings, EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData,
     PhantomDiffReviewIndicator, SelectPhase, Selection, SelectionDragState,
-    display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
-    hover_popover::hover_at, mouse_context_menu, scroll::ScrollPixelOffset,
+    display_map::ToDisplayPoint,
+    editor_settings::DoubleClickInMultibuffer,
+    hover_popover::hover_at,
+    mouse_context_menu,
+    scroll::{ScrollBehavior, ScrollPixelOffset},
 };
 
 impl EditorElement {
@@ -485,7 +488,6 @@ impl EditorElement {
             let position_map = layout.position_map.clone();
             let editor = self.editor.clone();
             let hitbox = layout.hitbox.clone();
-            let mut delta = ScrollDelta::default();
 
             // Set a minimum scroll_sensitivity of 0.01 to make sure the user doesn't
             // accidentally turn off their scrolling.
@@ -499,8 +501,6 @@ impl EditorElement {
 
             move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
-                    delta = delta.coalesce(event.delta);
-
                     if event.modifiers.secondary()
                         && editor.read(cx).enable_mouse_wheel_zoom
                         && EditorSettings::get_global(cx).mouse_wheel_zoom
@@ -529,9 +529,9 @@ impl EditorElement {
                         editor.update(cx, |editor, cx| {
                             let line_height = position_map.line_height;
                             let glyph_width = position_map.em_layout_width;
-                            let delta = match delta {
+                            let is_precise = matches!(event.delta, ScrollDelta::Pixels(_));
+                            let delta = match event.delta {
                                 gpui::ScrollDelta::Pixels(mut pixels) => {
-                                    //Trackpad
                                     editor
                                         .scroll_manager
                                         .filter_scroll_delta(&mut pixels, event.touch_phase);
@@ -539,12 +539,25 @@ impl EditorElement {
                                 }
 
                                 gpui::ScrollDelta::Lines(lines) => {
-                                    //Not trackpad
                                     point(lines.x * glyph_width, lines.y * line_height)
                                 }
                             };
 
-                            let current_scroll_position = position_map.snapshot.scroll_position();
+                            // Precise input follows the visible position, not a wheel
+                            // animation's pending destination. The OS supplies momentum.
+                            let current_scroll_position = if is_precise {
+                                editor.scroll_position(cx)
+                            } else {
+                                match editor
+                                    .scroll_manager
+                                    .scroll_animation()
+                                    .map(|animation| animation.target_position())
+                                {
+                                    Some(target) => target,
+                                    None => editor.scroll_position(cx),
+                                }
+                            };
+
                             let x = (current_scroll_position.x
                                 * ScrollPixelOffset::from(glyph_width)
                                 - ScrollPixelOffset::from(delta.x * scroll_sensitivity))
@@ -561,8 +574,25 @@ impl EditorElement {
                                 scroll_position.y = current_scroll_position.y;
                             }
 
-                            if scroll_position != current_scroll_position {
-                                editor.scroll(scroll_position, window, cx);
+                            let position_changed = scroll_position != current_scroll_position;
+                            // A gesture can begin with a zero delta; it must still
+                            // take control from an in-flight animation.
+                            if position_changed
+                                || (is_precise
+                                    && editor.scroll_manager.scroll_animation().is_some())
+                            {
+                                editor.scroll_with_behavior(
+                                    scroll_position,
+                                    Some(if is_precise {
+                                        ScrollBehavior::Instant
+                                    } else {
+                                        ScrollBehavior::RequestAnimation
+                                    }),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            if position_changed {
                                 cx.stop_propagation();
                             }
                         });

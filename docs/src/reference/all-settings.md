@@ -4182,6 +4182,38 @@ Non-negative `integer` values
 
 Non-negative `integer` values
 
+## Smooth Scroll
+
+- Description: Whether to animate line-based wheel and keyboard scrolling.
+- Setting: `smooth_scroll`
+- Default:
+
+```json [settings]
+{
+  "smooth_scroll": {
+    "enabled": false
+  }
+}
+```
+
+You can enable **Smooth Scroll** in the Settings Editor under **Editor > Scrolling**.
+
+Pixel-precise scroll input, including trackpad gestures and system-provided
+momentum, follows the input directly without added animation. Some mice also
+report pixel-precise input and use this direct scrolling behavior.
+
+> **Tip:** Consider increasing [`scroll_sensitivity`](#scroll-sensitivity) to make each scroll gesture cover more distance, allowing the animation to be more noticeable.
+
+### Enabled
+
+- Description: Whether smooth scrolling is enabled.
+- Setting: `enabled`
+- Default: `false`
+
+**Options**
+
+`boolean` values
+
 ## Search
 
 - Description: Search options to enable by default when opening new project and buffer searches.
