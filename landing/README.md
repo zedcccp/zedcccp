@@ -21,9 +21,9 @@ Do not serve the repository root.
 
 - Tokyo Night-inspired ink, blue, violet, cyan, and green; monospace details
   and a modal-editor motif nod to LazyVim without presenting this as a Vim distribution.
-- An original angular, Zed-inspired frame surrounds a hammer and sickle as a
-  community motif. `favicon.svg` is shared by the favicon, header, hero, and
-  footer so the mark stays consistent. It is not the official Zed logo.
+- The supplied `tokyonight_hammer_sickle.svg` artwork combines a blue geometric
+  Zed mark with a coral hammer and sickle. It is shared by the favicon, header,
+  hero, and footer so the mark stays consistent. It is not the official Zed logo.
 - Candid copy positions the fork as a bleeding-edge, slop-forward feature-testing
   ballpit, started for smooth scrolling support, not as a stable distribution.
 - A prominent thank-you credits the Zed team and upstream contributors for the
@@ -36,7 +36,7 @@ Do not serve the repository root.
 ## Eventual LXC / Cloudflare Tunnel deployment
 
 This directory is the entire public artifact: `index.html`, `styles.css`, and
-`favicon.svg`. Copy only those three files to the web server's document root.
+`tokyonight_hammer_sickle.svg`. Copy only those three files to the web server's document root.
 No Node or Rust runtime is needed in production.
 
 Suggested deployment shape:
