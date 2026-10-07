@@ -1,7 +1,9 @@
 use crate::{
     Autoscroll, Editor, EditorMode, NextScreen, NextScrollCursorCenterTopBottom,
     SCROLL_CENTER_TOP_BOTTOM_DEBOUNCE_TIMEOUT, ScrollCursorBottom, ScrollCursorCenter,
-    ScrollCursorCenterTopBottom, ScrollCursorTop, display_map::DisplayRow, scroll::ScrollOffset,
+    ScrollCursorCenterTopBottom, ScrollCursorTop,
+    display_map::DisplayRow,
+    scroll::{ScrollBehavior, ScrollOffset},
 };
 use gpui::{Context, Point, Window};
 
@@ -28,7 +30,28 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_scroll_position(scroll_position, window, cx);
+        self.scroll_with_behavior(scroll_position, None, window, cx);
+    }
+
+    pub fn scroll_with_behavior(
+        &mut self,
+        scroll_position: Point<ScrollOffset>,
+        behavior: Option<ScrollBehavior>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_position = self.scroll_position(cx);
+        self.scroll_manager
+            .scroll_to(current_position, scroll_position, behavior);
+        // Instant requests must remain observable before the next rendered frame.
+        if self
+            .scroll_manager
+            .scroll_animation()
+            .is_some_and(|animation| animation.is_finished())
+        {
+            self.advance_scroll_animation(window, cx);
+        }
+        cx.notify();
     }
 
     pub fn scroll_cursor_center_top_bottom(

@@ -18,7 +18,7 @@ use editor::{
     actions::{Backtab, FoldAll, SelectAll, Tab, UnfoldAll},
     items::active_match_index,
     multibuffer_context_lines,
-    scroll::Autoscroll,
+    scroll::{Autoscroll, ScrollBehavior},
 };
 use futures::{StreamExt, stream::FuturesOrdered};
 use gpui::{
@@ -1530,7 +1530,12 @@ impl ProjectSearchView {
                                             }
                                             this.entity.update(cx, |model, cx| model.clear(cx));
                                             this.results_editor.update(cx, |editor, cx| {
-                                                editor.scroll(Point::default(), window, cx);
+                                                editor.scroll_with_behavior(
+                                                    Point::default(),
+                                                    Some(ScrollBehavior::Instant),
+                                                    window,
+                                                    cx,
+                                                );
                                             });
                                         }
                                     })
@@ -2381,7 +2386,12 @@ impl ProjectSearchView {
                 self.results_editor.update(cx, |editor, cx| {
                     editor.clear_background_highlights(HighlightKey::ProjectSearchView, cx);
                     if concluded_no_results {
-                        editor.scroll(Point::default(), window, cx);
+                        editor.scroll_with_behavior(
+                            Point::default(),
+                            Some(ScrollBehavior::Instant),
+                            window,
+                            cx,
+                        );
                     }
                 });
             }
@@ -2403,7 +2413,12 @@ impl ProjectSearchView {
                         editor.change_selections(Default::default(), window, cx, |s| {
                             s.select_ranges(range_to_select)
                         });
-                        editor.scroll(Point::default(), window, cx);
+                        editor.scroll_with_behavior(
+                            Point::default(),
+                            Some(ScrollBehavior::Instant),
+                            window,
+                            cx,
+                        );
                     });
                     if phase == SearchPhase::Confirmed
                         && self.query_editor.focus_handle(cx).is_focused(window)
@@ -5931,7 +5946,12 @@ pub mod tests {
                     assert_eq!(results_editor.scroll_position(cx), Point::default());
 
                     // Scroll results all the way down
-                    results_editor.scroll(Point::new(0., f64::MAX), window, cx);
+                    results_editor.scroll_with_behavior(
+                        Point::new(0., f64::MAX),
+                        Some(ScrollBehavior::Instant),
+                        window,
+                        cx,
+                    );
                 });
             })
             .expect("unable to update search view");
@@ -7508,7 +7528,12 @@ pub mod tests {
                         Point::default(),
                         "a confirmed search scrolls to the top"
                     );
-                    results_editor.scroll(Point::new(0., f64::MAX), window, cx);
+                    results_editor.scroll_with_behavior(
+                        Point::new(0., f64::MAX),
+                        Some(ScrollBehavior::Instant),
+                        window,
+                        cx,
+                    );
                 });
             })
             .unwrap();
@@ -7590,7 +7615,12 @@ pub mod tests {
         search_view
             .update(cx, |search_view, window, cx| {
                 search_view.results_editor.update(cx, |results_editor, cx| {
-                    results_editor.scroll(Point::new(0., f64::MAX), window, cx);
+                    results_editor.scroll_with_behavior(
+                        Point::new(0., f64::MAX),
+                        Some(ScrollBehavior::Instant),
+                        window,
+                        cx,
+                    );
                     assert!(
                         results_editor.scroll_position(cx).y > 0.,
                         "results should be long enough to scroll down"
@@ -7620,7 +7650,12 @@ pub mod tests {
         search_view
             .update(cx, |search_view, window, cx| {
                 search_view.results_editor.update(cx, |results_editor, cx| {
-                    results_editor.scroll(Point::new(0., f64::MAX), window, cx);
+                    results_editor.scroll_with_behavior(
+                        Point::new(0., f64::MAX),
+                        Some(ScrollBehavior::Instant),
+                        window,
+                        cx,
+                    );
                 });
             })
             .unwrap();
@@ -8256,7 +8291,12 @@ pub mod tests {
         search_view
             .update(cx, |search_view, window, cx| {
                 search_view.results_editor.update(cx, |results_editor, cx| {
-                    results_editor.scroll(Point::new(0., f64::MAX), window, cx);
+                    results_editor.scroll_with_behavior(
+                        Point::new(0., f64::MAX),
+                        Some(ScrollBehavior::Instant),
+                        window,
+                        cx,
+                    );
                     assert!(
                         results_editor.scroll_position(cx).y > 0.,
                         "results should be long enough to scroll down"
@@ -8327,7 +8367,12 @@ pub mod tests {
         search_view
             .update(cx, |search_view, window, cx| {
                 search_view.results_editor.update(cx, |results_editor, cx| {
-                    results_editor.scroll(Point::new(0., f64::MAX), window, cx);
+                    results_editor.scroll_with_behavior(
+                        Point::new(0., f64::MAX),
+                        Some(ScrollBehavior::Instant),
+                        window,
+                        cx,
+                    );
                     assert!(
                         results_editor.scroll_position(cx).y > 0.,
                         "results should be long enough to scroll down"
